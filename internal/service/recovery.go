@@ -86,12 +86,17 @@ func (s *Service) SubmitReview(ctx context.Context, batchID string, generation i
 	if generation != batch.Generation {
 		return ErrStaleGeneration
 	}
+	// Qualify the reviewer before advancing the logical clock. A rejected
+	// review must never consume a tick: the stable-window gate measures
+	// elapsed logical time since the last stability event, so failed
+	// reviews advancing the clock would shorten the observation window and
+	// could let a release succeed before stability truly elapsed.
+	if !containsReviewer(batch.FrozenReviewers, reviewer) {
+		return ErrNotQualified
+	}
 	tick, err := s.store.NextTick(ctx)
 	if err != nil {
 		return err
-	}
-	if !containsReviewer(batch.FrozenReviewers, reviewer) {
-		return ErrNotQualified
 	}
 	decision := domain.ReviewDecision{
 		Generation: generation,
