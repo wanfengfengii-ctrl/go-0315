@@ -3,6 +3,7 @@ package service
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -131,21 +132,23 @@ func (s *Service) SubmitEvidence(ctx context.Context, batchID string, epochNo in
 		OperationID:  in.OperationID,
 		ObservedTick: in.ObservedTick,
 	}
-	if err := s.store.AppendEvidence(ctx, canonical, e); err != nil {
-		if err == store.ErrIdempotencyConflict {
-			return ErrIdempotencyConflict
-		}
+	// Verify the scan lease is active at the observed tick and append the
+	// evidence row in a single transaction. An expired lease must not leave a
+	// row behind: otherwise a resubmission with a valid tick collides with the
+	// stale row (idempotency conflict) and closing the epoch is tainted by the
+	// failed request's data.
+	leaseID := fmt.Sprintf("scan-%s-%d", canonical, epochNo)
+	err = s.store.AppendEvidenceIfLeaseActive(ctx, canonical, leaseID, e)
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, store.ErrLeaseNotActive):
+		return ErrLeaseConflict
+	case errors.Is(err, store.ErrIdempotencyConflict):
+		return ErrIdempotencyConflict
+	default:
 		return err
 	}
-
-	// Verify the scan lease is active at the observed tick; an expired lease
-	// rolls the whole submission back.
-	leaseID := fmt.Sprintf("scan-%s-%d", canonical, epochNo)
-	lease, err := s.store.GetLease(ctx, leaseID)
-	if err != nil || !leaseActive(lease, in.ObservedTick) {
-		return ErrLeaseConflict
-	}
-	return nil
 }
 
 // CloseEpoch forms the unique integrity verdict for every object, computes the
@@ -451,11 +454,4 @@ func nodeRoot(alg domain.HashAlgorithm, o *nodeObservation) []byte {
 		return nil
 	}
 	return root
-}
-
-func leaseActive(l *domain.ResourceLease, tick int64) bool {
-	if l == nil {
-		return false
-	}
-	return l.StartTick <= tick && tick < l.ExpiresTick
 }

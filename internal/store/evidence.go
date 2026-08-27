@@ -7,7 +7,12 @@ import (
 	"errors"
 
 	"archival-replica-integrity-recovery/internal/domain"
+	"archival-replica-integrity-recovery/internal/lease"
 )
+
+// ErrLeaseNotActive is returned when the scan lease covering an evidence
+// submission is missing or no longer active at the observed tick.
+var ErrLeaseNotActive = errors.New("store: scan lease not active")
 
 // OpenEpoch inserts a new scan epoch and returns its number.
 func (s *Store) OpenEpoch(ctx context.Context, batchID string, epochNo, tick int64) error {
@@ -43,35 +48,67 @@ func (s *Store) CloseEpoch(ctx context.Context, batchID string, epochNo, tick in
 // the same operation id re-arrives with different normalized content.
 func (s *Store) AppendEvidence(ctx context.Context, batchID string, e domain.ReplicaEvidence) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
-		var existingOp sql.NullString
-		var existingDigest []byte
-		var existingLen int64
-		err := tx.QueryRowContext(ctx,
-			`SELECT operation_id, digest, length FROM evidence WHERE batch_id = ? AND object_id = ? AND epoch_no = ? AND node_id = ? AND chunk_no = ?`,
-			batchID, e.ObjectID, e.EpochNo, e.NodeID, e.ChunkNo).Scan(&existingOp, &existingDigest, &existingLen)
-		switch {
-		case err == nil:
-			if existingOp.String == e.OperationID && bytes.Equal(existingDigest, e.Digest) && existingLen == e.Length {
-				// Idempotent replay: identical operation and normalized content.
-				return nil
-			}
-			return ErrIdempotencyConflict
-		case !errors.Is(err, sql.ErrNoRows):
-			return err
-		}
-
-		_, err = tx.ExecContext(ctx,
-			`INSERT INTO evidence (batch_id, object_id, epoch_no, node_id, chunk_no, length, digest, operation_id, observed_tick)
-			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-			batchID, e.ObjectID, e.EpochNo, e.NodeID, e.ChunkNo, e.Length, e.Digest, e.OperationID, e.ObservedTick)
-		if err != nil {
-			if isUniqueViolation(err) {
-				return ErrIdempotencyConflict
-			}
-			return err
-		}
-		return nil
+		return appendEvidenceTx(ctx, tx, batchID, e)
 	})
+}
+
+// AppendEvidenceIfLeaseActive verifies that the scan lease for the epoch is
+// active at the observed tick and, only then, appends the evidence row — both
+// inside a single transaction. If the lease is missing or expired no evidence is
+// written, so a later resubmission with a valid tick cannot collide with a
+// stale row from the failed request. It returns ErrIdempotencyConflict on a
+// same-key content change regardless of lease state, preserving the contract
+// that conflicting content under one operation id never succeeds.
+func (s *Store) AppendEvidenceIfLeaseActive(ctx context.Context, batchID, leaseID string, e domain.ReplicaEvidence) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var startTick, expiresTick int64
+		err := tx.QueryRowContext(ctx,
+			`SELECT start_tick, expires_tick FROM leases WHERE lease_id = ?`, leaseID).
+			Scan(&startTick, &expiresTick)
+		if errors.Is(err, sql.ErrNoRows) {
+			return ErrLeaseNotActive
+		}
+		if err != nil {
+			return err
+		}
+		if !lease.Active(e.ObservedTick, startTick, expiresTick) {
+			return ErrLeaseNotActive
+		}
+		return appendEvidenceTx(ctx, tx, batchID, e)
+	})
+}
+
+// appendEvidenceTx is the shared append-or-idempotency logic executed inside
+// the caller's transaction.
+func appendEvidenceTx(ctx context.Context, tx *sql.Tx, batchID string, e domain.ReplicaEvidence) error {
+	var existingOp sql.NullString
+	var existingDigest []byte
+	var existingLen int64
+	err := tx.QueryRowContext(ctx,
+		`SELECT operation_id, digest, length FROM evidence WHERE batch_id = ? AND object_id = ? AND epoch_no = ? AND node_id = ? AND chunk_no = ?`,
+		batchID, e.ObjectID, e.EpochNo, e.NodeID, e.ChunkNo).Scan(&existingOp, &existingDigest, &existingLen)
+	switch {
+	case err == nil:
+		if existingOp.String == e.OperationID && bytes.Equal(existingDigest, e.Digest) && existingLen == e.Length {
+			// Idempotent replay: identical operation and normalized content.
+			return nil
+		}
+		return ErrIdempotencyConflict
+	case !errors.Is(err, sql.ErrNoRows):
+		return err
+	}
+
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO evidence (batch_id, object_id, epoch_no, node_id, chunk_no, length, digest, operation_id, observed_tick)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		batchID, e.ObjectID, e.EpochNo, e.NodeID, e.ChunkNo, e.Length, e.Digest, e.OperationID, e.ObservedTick)
+	if err != nil {
+		if isUniqueViolation(err) {
+			return ErrIdempotencyConflict
+		}
+		return err
+	}
+	return nil
 }
 
 // ListEvidence returns all evidence for an epoch ordered deterministically.
