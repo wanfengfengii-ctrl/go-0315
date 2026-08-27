@@ -38,6 +38,23 @@ func (s *Store) CloseEpoch(ctx context.Context, batchID string, epochNo, tick in
 	return nil
 }
 
+// EpochClosed reports whether the scan epoch has already been closed. It lets
+// the service short-circuit a retried close before any isolation generation is
+// advanced, so a duplicate close never opens a new generation. A missing epoch
+// row is surfaced as ErrNotFound so the caller can treat it as a conflict.
+func (s *Store) EpochClosed(ctx context.Context, batchID string, epochNo int64) (bool, error) {
+	var closedTick sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT closed_tick FROM epochs WHERE batch_id = ? AND epoch_no = ?`, batchID, epochNo).Scan(&closedTick)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNotFound
+	}
+	if err != nil {
+		return false, err
+	}
+	return closedTick.Valid, nil
+}
+
 // AppendEvidence inserts a single normalized evidence row. The unique key is
 // (batch, object, epoch, node, chunk). It returns ErrIdempotencyConflict when
 // the same operation id re-arrives with different normalized content.

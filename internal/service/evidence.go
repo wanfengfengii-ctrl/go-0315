@@ -169,6 +169,18 @@ func (s *Service) CloseEpoch(ctx context.Context, batchID string, epochNo int64)
 	if epochNo != batch.CurrentEpoch {
 		return nil, ErrQuorumConflict
 	}
+	// Reject a retried close before mutating any state. Once an epoch is closed,
+	// re-running the close must surface the same conflict without advancing a
+	// new isolation generation, otherwise the prior generation's repair and
+	// review paths are stranded behind a generation that never opens a closure.
+	if closed, err := s.store.EpochClosed(ctx, canonical, epochNo); err != nil {
+		if err == store.ErrNotFound {
+			return nil, ErrQuorumConflict
+		}
+		return nil, err
+	} else if closed {
+		return nil, ErrQuorumConflict
+	}
 
 	objects, err := s.store.ListObjects(ctx, canonical)
 	if err != nil {
