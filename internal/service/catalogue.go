@@ -56,17 +56,27 @@ func (s *Service) CreateBatch(ctx context.Context, batchID string) error {
 }
 
 // CatalogBatch validates and stores the object catalogue, dependency edges and
-// node roster. It is only valid while the batch is a draft.
+// node roster. It is only valid while the batch is a draft. All three tables are
+// replaced inside a single database transaction: the draft status is checked
+// inside that transaction, so a frozen batch is rejected with ErrAlreadyFrozen
+// and the existing catalogue is left completely untouched. This guarantees a
+// failed update never leaves a partially replaced catalogue whose objects,
+// dependencies and node roster disagree with each other or with the frozen
+// policy digest.
 func (s *Service) CatalogBatch(ctx context.Context, batchID string, objects []CatalogObject, deps []CatalogDependency, nodes []CatalogNode) error {
 	canonical, err := domain.CanonicalizeID(batchID)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidCatalog, err)
 	}
-	if _, err := s.store.GetBatch(ctx, canonical); err != nil {
+	batch, err := s.store.GetBatch(ctx, canonical)
+	if err != nil {
 		if err == store.ErrNotFound {
 			return ErrBatchNotFound
 		}
 		return err
+	}
+	if batch.Status != domain.StatusDraft {
+		return ErrAlreadyFrozen
 	}
 
 	domainObjects, err := s.validateCatalog(objects, deps, nodes)
@@ -77,17 +87,17 @@ func (s *Service) CatalogBatch(ctx context.Context, batchID string, objects []Ca
 	for i, d := range deps {
 		domainDeps[i] = domain.ObjectDependency{FromObject: d.FromObject, ToObject: d.ToObject, Reason: d.Reason}
 	}
-	if err := s.store.PutDependencies(ctx, canonical, domainDeps); err != nil {
-		return err
-	}
 	domainNodes := make([]domain.StorageNode, len(nodes))
 	for i, n := range nodes {
 		domainNodes[i] = domain.StorageNode{NodeID: n.NodeID, FailureDomain: n.FailureDomain, Enabled: n.Enabled}
 	}
-	if err := s.store.PutNodes(ctx, canonical, domainNodes); err != nil {
-		return err
-	}
-	if err := s.store.PutObjects(ctx, canonical, domainObjects); err != nil {
+	if err := s.store.PutCatalog(ctx, canonical, domainObjects, domainDeps, domainNodes); err != nil {
+		if err == store.ErrAlreadyFrozen {
+			return ErrAlreadyFrozen
+		}
+		if err == store.ErrNotFound {
+			return ErrBatchNotFound
+		}
 		return err
 	}
 	return nil

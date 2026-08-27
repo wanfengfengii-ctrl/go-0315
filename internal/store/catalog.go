@@ -40,9 +40,22 @@ func (s *Store) PutObjects(ctx context.Context, batchID string, objects []domain
 	})
 }
 
-// PutDependencies replaces the dependency edge set for a batch.
+// PutDependencies replaces the dependency edge set for a batch. It is only
+// valid while the batch is a draft: the status is checked inside the
+// transaction before any row is mutated, so a frozen batch is rejected with
+// ErrAlreadyFrozen and the existing edges are left intact.
 func (s *Store) PutDependencies(ctx context.Context, batchID string, deps []domain.ObjectDependency) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var status domain.Status
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM batches WHERE batch_id = ?`, batchID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != domain.StatusDraft {
+			return ErrAlreadyFrozen
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM dependencies WHERE batch_id = ?`, batchID); err != nil {
 			return err
 		}
@@ -60,9 +73,90 @@ func (s *Store) PutDependencies(ctx context.Context, batchID string, deps []doma
 	})
 }
 
-// PutNodes replaces the storage node roster for a batch.
+// PutNodes replaces the storage node roster for a batch. It is only valid
+// while the batch is a draft: the status is checked inside the transaction
+// before any row is mutated, so a frozen batch is rejected with
+// ErrAlreadyFrozen and the existing roster is left intact.
 func (s *Store) PutNodes(ctx context.Context, batchID string, nodes []domain.StorageNode) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var status domain.Status
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM batches WHERE batch_id = ?`, batchID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != domain.StatusDraft {
+			return ErrAlreadyFrozen
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE batch_id = ?`, batchID); err != nil {
+			return err
+		}
+		for _, n := range nodes {
+			enabled := 0
+			if n.Enabled {
+				enabled = 1
+			}
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO nodes (batch_id, node_id, failure_domain, enabled) VALUES (?, ?, ?, ?)`,
+				batchID, n.NodeID, n.FailureDomain, enabled); err != nil {
+				if isUniqueViolation(err) {
+					return fmt.Errorf("%w: node %s", ErrAlreadyExists, n.NodeID)
+				}
+				return err
+			}
+		}
+		return nil
+	})
+}
+
+// PutCatalog atomically replaces the object catalogue, dependency edges and
+// node roster for a batch in a single transaction. It is only valid while the
+// batch is a draft: the draft status is checked once inside the transaction
+// before any row is mutated, so a post-freeze or otherwise non-draft batch is
+// rejected with ErrAlreadyFrozen and leaves the catalogue untouched. Keeping
+// all three tables in one transaction guarantees that a failed update never
+// leaves a partially replaced catalogue (e.g. nodes and dependencies swapped
+// while objects are left stale, or a frozen policy digest pointing at rows
+// that no longer match it).
+func (s *Store) PutCatalog(ctx context.Context, batchID string, objects []domain.ArchiveObject, deps []domain.ObjectDependency, nodes []domain.StorageNode) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		var status domain.Status
+		if err := tx.QueryRowContext(ctx, `SELECT status FROM batches WHERE batch_id = ?`, batchID).Scan(&status); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrNotFound
+			}
+			return err
+		}
+		if status != domain.StatusDraft {
+			return ErrAlreadyFrozen
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE batch_id = ?`, batchID); err != nil {
+			return err
+		}
+		for _, o := range objects {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO objects (batch_id, object_id, canonical_key, expected_length, expected_root) VALUES (?, ?, ?, ?, ?)`,
+				batchID, o.ObjectID, o.CanonicalKey, o.ExpectedLength, o.ExpectedRoot); err != nil {
+				if isUniqueViolation(err) {
+					return fmt.Errorf("%w: object %s", ErrAlreadyExists, o.ObjectID)
+				}
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM dependencies WHERE batch_id = ?`, batchID); err != nil {
+			return err
+		}
+		for _, d := range deps {
+			if _, err := tx.ExecContext(ctx,
+				`INSERT INTO dependencies (batch_id, from_object, to_object, reason) VALUES (?, ?, ?, ?)`,
+				batchID, d.FromObject, d.ToObject, d.Reason); err != nil {
+				if isUniqueViolation(err) {
+					return fmt.Errorf("%w: dependency %s->%s", ErrAlreadyExists, d.FromObject, d.ToObject)
+				}
+				return err
+			}
+		}
 		if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE batch_id = ?`, batchID); err != nil {
 			return err
 		}
