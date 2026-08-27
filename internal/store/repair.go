@@ -76,6 +76,22 @@ func (s *Store) ListPendingRepairs(ctx context.Context, tick int64) ([]RepairTas
 	return scanRepairRows(rows)
 }
 
+// ReactivateFailedRepairs transitions repair tasks whose deterministic backoff
+// has elapsed from failed back to pending at the current tick. It mirrors the
+// startup recovery rule (see Store.recover) so that a running service retries
+// due tasks once the logical clock passes their next_tick, instead of waiting
+// for a restart. The transition is idempotent: a task already pending is left
+// untouched, and only its state changes (next_tick and failure_category are
+// preserved for inspection until the next attempt overwrites them).
+func (s *Store) ReactivateFailedRepairs(ctx context.Context, tick int64) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`UPDATE repair_tasks SET state = ? WHERE state = ? AND next_tick <= ?`,
+			domain.RepairPending, domain.RepairFailed, tick)
+		return err
+	})
+}
+
 // ListGenerationRepairs returns all repair tasks for a generation.
 func (s *Store) ListGenerationRepairs(ctx context.Context, batchID string, generation int64) ([]RepairTaskRecord, error) {
 	rows, err := s.db.QueryContext(ctx,

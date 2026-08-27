@@ -178,7 +178,18 @@ func chooseTrustedSource(obs map[string]*nodeObservation, root []byte, nodeDomai
 // DispatchRepair records a single external copy attempt for a pending task. It
 // marks the task dispatched, invokes the adapter outside any transaction, then
 // persists either the failure retry tick or leaves the task awaiting a receipt.
+// A failed task whose backoff has elapsed is reactivated to pending first, so
+// the same repair id can be re-dispatched once next_tick is reached without a
+// restart.
 func (s *Service) DispatchRepair(ctx context.Context, repairID string) (RepairView, error) {
+	tick, err := s.store.CurrentTick(ctx)
+	if err != nil {
+		return RepairView{}, err
+	}
+	if err := s.store.ReactivateFailedRepairs(ctx, tick); err != nil {
+		return RepairView{}, err
+	}
+
 	task, err := s.store.GetRepairTask(ctx, repairID)
 	if err != nil {
 		if err == store.ErrNotFound {
@@ -200,11 +211,11 @@ func (s *Service) DispatchRepair(ctx context.Context, repairID string) (RepairVi
 		return repairViewFrom(task.ID, domain.RepairDispatched, task), nil
 	}
 
-	tick, err := s.store.NextTick(ctx)
+	failTick, err := s.store.NextTick(ctx)
 	if err != nil {
 		return RepairView{}, err
 	}
-	next := backoffTick(tick, task.AttemptNo+1)
+	next := backoffTick(failTick, task.AttemptNo+1)
 	if err := s.store.RecordRepairFailure(ctx, repairID, next, category); err != nil {
 		return RepairView{}, err
 	}
@@ -261,10 +272,15 @@ func (s *Service) ListRepairs(ctx context.Context, batchID string, generation in
 }
 
 // PendingRepairs returns every repair task eligible for dispatch at the
-// current logical tick.
+// current logical tick. Before reading, it reactivates failed tasks whose
+// deterministic backoff has already elapsed so a running service keeps
+// retrying once the next_tick is reached, rather than requiring a restart.
 func (s *Service) PendingRepairs(ctx context.Context) ([]RepairView, error) {
 	tick, err := s.store.CurrentTick(ctx)
 	if err != nil {
+		return nil, err
+	}
+	if err := s.store.ReactivateFailedRepairs(ctx, tick); err != nil {
 		return nil, err
 	}
 	rows, err := s.store.ListPendingRepairs(ctx, tick)
