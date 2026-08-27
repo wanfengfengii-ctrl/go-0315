@@ -101,12 +101,24 @@ func (s *Store) FreezeBatch(ctx context.Context, batchID, policyDigest string, p
 	})
 }
 
-// AdvanceEpoch increments the batch current_epoch and returns the new value.
-func (s *Store) AdvanceEpoch(ctx context.Context, batchID string) (int64, error) {
+// AdvanceEpoch conditionally increments the batch current_epoch and returns
+// the new value. It only advances when current_epoch still equals expectPrev,
+// so the open path can prove it won the epoch it leased rather than silently
+// racing a concurrent writer; the scan lease already serializes opens, this
+// guard makes the invariant independent of that timing. Returns ErrConflict
+// when the current_epoch no longer matches expectPrev.
+func (s *Store) AdvanceEpoch(ctx context.Context, batchID string, expectPrev int64) (int64, error) {
 	var epoch int64
 	err := s.withTx(ctx, func(tx *sql.Tx) error {
-		return tx.QueryRowContext(ctx,
-			`UPDATE batches SET current_epoch = current_epoch + 1 WHERE batch_id = ? RETURNING current_epoch`, batchID).Scan(&epoch)
+		if err := tx.QueryRowContext(ctx,
+			`UPDATE batches SET current_epoch = current_epoch + 1 WHERE batch_id = ? AND current_epoch = ? RETURNING current_epoch`,
+			batchID, expectPrev).Scan(&epoch); err != nil {
+			if errors.Is(err, sql.ErrNoRows) {
+				return ErrConflict
+			}
+			return err
+		}
+		return nil
 	})
 	return epoch, err
 }

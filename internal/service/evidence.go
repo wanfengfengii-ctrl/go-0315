@@ -28,7 +28,14 @@ type EvidenceInput struct {
 }
 
 // OpenEpoch opens a new scan epoch for a frozen batch and returns its number.
-// It acquires the internal scan lease for the batch in the same transaction.
+// It acquires the internal scan lease for the batch before any durable epoch
+// state is touched: the scan lease is keyed by the batch (one active scan per
+// batch), so a conflicting re-open while an epoch is already scanning is
+// rejected at lease acquisition with no side effects. The current_epoch
+// counter is advanced and the epoch row inserted only after the lease is won,
+// and the lease is rolled back if either step fails, so a failed open can
+// never advance current_epoch or leave a phantom open epoch that would block
+// the in-progress scan.
 func (s *Service) OpenEpoch(ctx context.Context, batchID string) (int64, error) {
 	canonical, err := domain.CanonicalizeID(batchID)
 	if err != nil {
@@ -45,18 +52,17 @@ func (s *Service) OpenEpoch(ctx context.Context, batchID string) (int64, error) 
 		return 0, ErrNotFrozen
 	}
 
-	epoch, err := s.store.AdvanceEpoch(ctx, canonical)
-	if err != nil {
-		return 0, err
-	}
+	// Derive the next epoch number from current_epoch without mutating it. The
+	// counter is committed only after the scan lease is won, so a conflicting
+	// re-open fails before any durable epoch state is touched.
+	epoch := batch.CurrentEpoch + 1
 	tick, err := s.store.NextTick(ctx)
 	if err != nil {
 		return 0, err
 	}
-	if err := s.store.OpenEpoch(ctx, canonical, epoch, tick); err != nil {
-		return 0, err
-	}
-	// Acquire the scan lease so evidence submission can verify it is active.
+	// Acquire the scan lease first. The unique (resource_type, resource_key)
+	// constraint is the single arbiter: if an epoch is already scanning, this
+	// fails with no durable epoch side effects.
 	lease := domain.ResourceLease{
 		ResourceType: domain.ResourceScan,
 		ResourceKey:  canonical,
@@ -68,6 +74,19 @@ func (s *Service) OpenEpoch(ctx context.Context, batchID string) (int64, error) 
 	}
 	if err := s.store.AcquireLease(ctx, lease); err != nil {
 		return 0, ErrLeaseConflict
+	}
+	// Lease won. Advance current_epoch conditionally from the value observed
+	// above so it commits exactly the leased epoch; the scan lease serializes
+	// opens and this guard makes that invariant explicit. If either durable
+	// step fails, roll the lease back so the batch stays consistent and the
+	// failed open disturbs no in-progress epoch.
+	if _, err := s.store.AdvanceEpoch(ctx, canonical, batch.CurrentEpoch); err != nil {
+		_ = s.store.ReleaseLease(ctx, lease.LeaseID, "scan")
+		return 0, err
+	}
+	if err := s.store.OpenEpoch(ctx, canonical, epoch, tick); err != nil {
+		_ = s.store.ReleaseLease(ctx, lease.LeaseID, "scan")
+		return 0, err
 	}
 	return epoch, nil
 }
