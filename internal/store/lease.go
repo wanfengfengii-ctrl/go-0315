@@ -19,17 +19,28 @@ var (
 
 // AcquireLease persists an exclusive lease over a resource. It fails when an
 // active lease already covers the resource at start or when the requested
-// interval is not active at its own start.
+// interval is not active at its own start. A prior lease that has already
+// expired (tick >= its expires) is replaced so that a fresh worker can take
+// over the resource at the expiry boundary, per the half-open interval.
 func (s *Store) AcquireLease(ctx context.Context, l domain.ResourceLease) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var curStart, curExpires int64
 		err := tx.QueryRowContext(ctx,
 			`SELECT start_tick, expires_tick FROM leases WHERE resource_type = ? AND resource_key = ?`,
 			l.ResourceType, l.ResourceKey).Scan(&curStart, &curExpires)
-		if err == nil && lease.Active(l.StartTick, curStart, curExpires) {
-			return ErrLeaseHeld
-		}
-		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		if err == nil {
+			if lease.Active(l.StartTick, curStart, curExpires) {
+				return ErrLeaseHeld
+			}
+			// The held lease has already expired at the requested start: clear
+			// its row so the new lease can occupy the (resource_type,
+			// resource_key) primary key without a unique violation.
+			if _, err := tx.ExecContext(ctx,
+				`DELETE FROM leases WHERE resource_type = ? AND resource_key = ?`,
+				l.ResourceType, l.ResourceKey); err != nil {
+				return err
+			}
+		} else if !errors.Is(err, sql.ErrNoRows) {
 			return err
 		}
 		if !lease.Active(l.StartTick, l.StartTick, l.ExpiresTick) {
