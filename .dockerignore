@@ -1,0 +1,10 @@
+.git
+.gitignore
+**/.DS_Store
+*.db
+*.db-*
+/out/
+/dist/
+**/node_modules/
+**/dist/
+.benzhi-build/
