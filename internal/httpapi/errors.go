@@ -38,6 +38,11 @@ func mapError(err error) (int, ErrorCode, string) {
 	case errors.Is(err, service.ErrNotReady):
 		return http.StatusConflict, CodeNotReady, err.Error()
 
+	case errors.Is(err, service.ErrCancelled):
+		// 499 is the conventional status for a client that closed the
+		// connection before the response was written.
+		return 499, CodeCancelled, "request cancelled"
+
 	case errors.Is(err, service.ErrInvalidPolicy),
 		errors.Is(err, service.ErrInvalidCatalog):
 		return http.StatusBadRequest, CodeMalformedRequest, err.Error()

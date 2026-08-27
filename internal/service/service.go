@@ -47,4 +47,5 @@ var (
 	ErrRepairNotFound      = errors.New("service: repair task not found")
 	ErrNotQualified        = errors.New("service: reviewer not qualified")
 	ErrNotReady            = errors.New("service: not ready for terminal decision")
+	ErrCancelled           = errors.New("service: request cancelled")
 )

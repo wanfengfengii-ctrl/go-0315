@@ -26,6 +26,7 @@ const (
 	CodeNotFound            ErrorCode = "NOT_FOUND"
 	CodeNotQualified        ErrorCode = "NOT_QUALIFIED"
 	CodeNotReady            ErrorCode = "NOT_READY"
+	CodeCancelled           ErrorCode = "CANCELLED"
 	CodeInternal            ErrorCode = "INTERNAL"
 )
 

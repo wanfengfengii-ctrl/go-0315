@@ -1,6 +1,7 @@
 package service
 
 import (
+	"context"
 	"sync"
 
 	"archival-replica-integrity-recovery/internal/domain"
@@ -11,16 +12,26 @@ import (
 // outcome as a failure category; an empty category means the copy succeeded.
 // Calls happen outside database transactions so that external failures never
 // leave partially-committed domain state.
+//
+// The context carries the caller's cancellation signal. When ctx is already
+// cancelled before the copy begins, implementations must report
+// FailureCancelled and perform no storage-node side effect, so a client that
+// dropped the connection after the dispatch request started but before the
+// copy was issued leaves the task untouched.
 type RepairAdapter interface {
-	Copy(sourceNode, targetNode, objectID string, chunkNo int64) domain.RepairFailureCategory
+	Copy(ctx context.Context, sourceNode, targetNode, objectID string, chunkNo int64) domain.RepairFailureCategory
 }
 
 // SuccessAdapter always reports a successful copy. It is the default adapter
 // used by the executable when no external storage integration is configured.
 type SuccessAdapter struct{}
 
-// Copy always succeeds.
-func (SuccessAdapter) Copy(sourceNode, targetNode, objectID string, chunkNo int64) domain.RepairFailureCategory {
+// Copy always succeeds unless the context is already cancelled, in which case
+// it reports FailureCancelled without performing any work.
+func (SuccessAdapter) Copy(ctx context.Context, sourceNode, targetNode, objectID string, chunkNo int64) domain.RepairFailureCategory {
+	if err := ctx.Err(); err != nil {
+		return domain.FailureCancelled
+	}
 	return ""
 }
 
@@ -39,8 +50,14 @@ func NewScriptedAdapter(sequence ...domain.RepairFailureCategory) *ScriptedAdapt
 	return &ScriptedAdapter{sequence: sequence}
 }
 
-// Copy returns the next scripted outcome, holding the final one forever.
-func (a *ScriptedAdapter) Copy(sourceNode, targetNode, objectID string, chunkNo int64) domain.RepairFailureCategory {
+// Copy returns the next scripted outcome, holding the final one forever. A
+// cancelled context short-circuits to FailureCancelled without consuming a
+// scripted outcome, so cancellation is observable independently of the
+// scripted sequence.
+func (a *ScriptedAdapter) Copy(ctx context.Context, sourceNode, targetNode, objectID string, chunkNo int64) domain.RepairFailureCategory {
+	if err := ctx.Err(); err != nil {
+		return domain.FailureCancelled
+	}
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	a.calls++

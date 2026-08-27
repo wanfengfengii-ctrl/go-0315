@@ -1,7 +1,6 @@
 package httpapi
 
 import (
-	"context"
 	"net/http"
 	"strconv"
 	"strings"
@@ -452,7 +451,7 @@ func (s *Server) handleRepairDispatch(w http.ResponseWriter, r *http.Request, re
 		writeError(w, http.StatusMethodNotAllowed, CodeMalformedRequest, "dispatch requires POST", nil)
 		return
 	}
-	view, err := s.svc.DispatchRepair(context.Background(), repairID)
+	view, err := s.svc.DispatchRepair(r.Context(), repairID)
 	if err != nil {
 		s.writeServiceError(w, err)
 		return

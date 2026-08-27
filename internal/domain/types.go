@@ -74,6 +74,7 @@ const (
 	FailureDisconnect     RepairFailureCategory = "disconnect"
 	FailureMalformed      RepairFailureCategory = "malformed"
 	FailureDigestMismatch RepairFailureCategory = "digest_mismatch"
+	FailureCancelled      RepairFailureCategory = "cancelled"
 )
 
 // TerminalKind is the outcome of a terminal arbitration request.

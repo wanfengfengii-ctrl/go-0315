@@ -178,7 +178,20 @@ func chooseTrustedSource(obs map[string]*nodeObservation, root []byte, nodeDomai
 // DispatchRepair records a single external copy attempt for a pending task. It
 // marks the task dispatched, invokes the adapter outside any transaction, then
 // persists either the failure retry tick or leaves the task awaiting a receipt.
+//
+// The caller's context carries its cancellation signal. A request whose client
+// has already gone away (or that is cancelled mid-flight) must not start any
+// dispatch side effect: the task stays pending and no chunk copy is issued to
+// the target node. The context is checked both before the dispatch transition
+// — so an already-cancelled request leaves the task untouched — and again just
+// before invoking the adapter, so a cancellation that arrives after the task
+// was marked dispatched records a deterministic cancelled retry rather than
+// performing the external copy.
 func (s *Service) DispatchRepair(ctx context.Context, repairID string) (RepairView, error) {
+	if err := ctx.Err(); err != nil {
+		return RepairView{}, ErrCancelled
+	}
+
 	task, err := s.store.GetRepairTask(ctx, repairID)
 	if err != nil {
 		if err == store.ErrNotFound {
@@ -194,7 +207,7 @@ func (s *Service) DispatchRepair(ctx context.Context, repairID string) (RepairVi
 		return RepairView{}, err
 	}
 
-	category := s.adapter.Copy(task.SourceNode, task.TargetNode, task.ObjectID, task.ChunkNo)
+	category := s.adapter.Copy(ctx, task.SourceNode, task.TargetNode, task.ObjectID, task.ChunkNo)
 	if category == "" {
 		// Copy succeeded; the task awaits a verified receipt.
 		return repairViewFrom(task.ID, domain.RepairDispatched, task), nil
