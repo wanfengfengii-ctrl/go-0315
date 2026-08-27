@@ -9,9 +9,14 @@ import (
 	"archival-replica-integrity-recovery/internal/domain"
 )
 
-// PutObjects replaces the full object catalogue for a batch in one
-// transaction. It is only valid while the batch is a draft.
-func (s *Store) PutObjects(ctx context.Context, batchID string, objects []domain.ArchiveObject) error {
+// ReplaceCatalog atomically replaces the full object catalogue, dependency
+// edges and node roster for a batch inside a single transaction. All three sets
+// are deleted and re-inserted together — if any insert fails (for example a
+// duplicate dependency edge or node), the whole replacement is rolled back and
+// the previous catalogue remains intact. It is only valid while the batch is a
+// draft; the draft status is re-checked inside the same transaction so a
+// concurrent freeze cannot race the replacement.
+func (s *Store) ReplaceCatalog(ctx context.Context, batchID string, objects []domain.ArchiveObject, deps []domain.ObjectDependency, nodes []domain.StorageNode) error {
 	return s.withTx(ctx, func(tx *sql.Tx) error {
 		var status domain.Status
 		if err := tx.QueryRowContext(ctx, `SELECT status FROM batches WHERE batch_id = ?`, batchID).Scan(&status); err != nil {
@@ -23,6 +28,7 @@ func (s *Store) PutObjects(ctx context.Context, batchID string, objects []domain
 		if status != domain.StatusDraft {
 			return ErrAlreadyFrozen
 		}
+
 		if _, err := tx.ExecContext(ctx, `DELETE FROM objects WHERE batch_id = ?`, batchID); err != nil {
 			return err
 		}
@@ -36,13 +42,7 @@ func (s *Store) PutObjects(ctx context.Context, batchID string, objects []domain
 				return err
 			}
 		}
-		return nil
-	})
-}
 
-// PutDependencies replaces the dependency edge set for a batch.
-func (s *Store) PutDependencies(ctx context.Context, batchID string, deps []domain.ObjectDependency) error {
-	return s.withTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM dependencies WHERE batch_id = ?`, batchID); err != nil {
 			return err
 		}
@@ -56,13 +56,7 @@ func (s *Store) PutDependencies(ctx context.Context, batchID string, deps []doma
 				return err
 			}
 		}
-		return nil
-	})
-}
 
-// PutNodes replaces the storage node roster for a batch.
-func (s *Store) PutNodes(ctx context.Context, batchID string, nodes []domain.StorageNode) error {
-	return s.withTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, `DELETE FROM nodes WHERE batch_id = ?`, batchID); err != nil {
 			return err
 		}

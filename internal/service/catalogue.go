@@ -62,32 +62,30 @@ func (s *Service) CatalogBatch(ctx context.Context, batchID string, objects []Ca
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInvalidCatalog, err)
 	}
-	if _, err := s.store.GetBatch(ctx, canonical); err != nil {
-		if err == store.ErrNotFound {
-			return ErrBatchNotFound
-		}
-		return err
-	}
-
 	domainObjects, err := s.validateCatalog(objects, deps, nodes)
 	if err != nil {
-		return err
-	}
-	if err := s.store.PutObjects(ctx, canonical, domainObjects); err != nil {
 		return err
 	}
 	domainDeps := make([]domain.ObjectDependency, len(deps))
 	for i, d := range deps {
 		domainDeps[i] = domain.ObjectDependency{FromObject: d.FromObject, ToObject: d.ToObject, Reason: d.Reason}
 	}
-	if err := s.store.PutDependencies(ctx, canonical, domainDeps); err != nil {
-		return err
-	}
 	domainNodes := make([]domain.StorageNode, len(nodes))
 	for i, n := range nodes {
 		domainNodes[i] = domain.StorageNode{NodeID: n.NodeID, FailureDomain: n.FailureDomain, Enabled: n.Enabled}
 	}
-	return s.store.PutNodes(ctx, canonical, domainNodes)
+
+	// ReplaceCatalog validates draft status and writes objects, dependencies
+	// and nodes atomically inside a single transaction. A failed replacement
+	// (e.g. a duplicate dependency edge) therefore rolls back all three sets,
+	// leaving the previous catalogue intact instead of a half-replaced one.
+	if err := s.store.ReplaceCatalog(ctx, canonical, domainObjects, domainDeps, domainNodes); err != nil {
+		if err == store.ErrNotFound {
+			return ErrBatchNotFound
+		}
+		return err
+	}
+	return nil
 }
 
 // validateCatalog canonicalizes and validates the whole catalogue, returning
