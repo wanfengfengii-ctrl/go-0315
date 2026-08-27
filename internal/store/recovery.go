@@ -179,6 +179,43 @@ func (s *Store) GetCredential(ctx context.Context, batchID string, generation in
 	return &c, nil
 }
 
+// FinalizeRelease atomically records the release terminal decision, the unique
+// recovery credential and the batch terminal status in a single transaction.
+// This enforces the documented failure boundary for terminal issuance: a
+// release either completes with its credential or leaves no partial terminal
+// state, so a transient credential-store failure cannot strand the generation
+// in an unreleasable terminal-conflict state on retry. It fails with
+// ErrConflict when a terminal decision already exists, preserving the
+// single-terminal arbitration race.
+func (s *Store) FinalizeRelease(ctx context.Context, batchID string, decision domain.TerminalDecision, credential domain.RecoveryCredential) error {
+	return s.withTx(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO terminal_decisions (batch_id, generation, kind, tick) VALUES (?, ?, ?, ?)`,
+			batchID, decision.Generation, decision.Kind, decision.Tick)
+		if err != nil {
+			if isUniqueViolation(err) {
+				return ErrConflict
+			}
+			return err
+		}
+		if n, _ := res.RowsAffected(); n != 1 {
+			return ErrConflict
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO recovery_credentials (batch_id, generation, credential, issued_tick) VALUES (?, ?, ?, ?)`,
+			batchID, credential.Generation, credential.Credential, credential.IssuedTick); err != nil {
+			if isUniqueViolation(err) {
+				return ErrConflict
+			}
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `UPDATE batches SET status = ? WHERE batch_id = ?`, domain.StatusTerminal, batchID); err != nil {
+			return err
+		}
+		return nil
+	})
+}
+
 func boolToInt(b bool) int {
 	if b {
 		return 1

@@ -165,25 +165,40 @@ func (s *Service) Terminal(ctx context.Context, batchID string, generation int64
 		Kind:       domain.TerminalKind(kind),
 		Tick:       tick,
 	}
+
+	if kind == TerminalRelease {
+		// Issue the credential before persisting any terminal state, so a
+		// generation failure never produces a credential-less release. The
+		// credential and terminal decision are then committed atomically by
+		// FinalizeRelease, matching the documented failure boundary: terminal
+		// issuance either completes with its credential or leaves no partial
+		// state. A transient store failure rolls back fully and the release
+		// can be retried instead of stranding the generation.
+		buf := make([]byte, 32)
+		if _, err := rand.Read(buf); err != nil {
+			return nil, err
+		}
+		credential := domain.RecoveryCredential{
+			Generation: generation,
+			Credential: buf,
+			IssuedTick: tick,
+		}
+		if err := s.store.FinalizeRelease(ctx, canonical, decision, credential); err != nil {
+			if err == store.ErrConflict {
+				return nil, ErrTerminalConflict
+			}
+			return nil, err
+		}
+		return &TerminalOutcome{Kind: kind, Generation: generation, Tick: tick, Credential: hex.EncodeToString(buf)}, nil
+	}
+
 	if err := s.store.PutTerminal(ctx, canonical, decision); err != nil {
 		if err == store.ErrConflict {
 			return nil, ErrTerminalConflict
 		}
 		return nil, err
 	}
-
-	outcome := &TerminalOutcome{Kind: kind, Generation: generation, Tick: tick}
-	if kind == TerminalRelease {
-		credential, err := s.issueCredential(ctx, canonical, generation, tick)
-		if err != nil {
-			return nil, err
-		}
-		outcome.Credential = credential
-		if err := s.store.MarkTerminal(ctx, canonical); err != nil {
-			return nil, err
-		}
-	}
-	return outcome, nil
+	return &TerminalOutcome{Kind: kind, Generation: generation, Tick: tick}, nil
 }
 
 // releaseReady enforces the four release gates: all repairs confirmed, every
@@ -280,22 +295,6 @@ func (s *Service) releaseReady(ctx context.Context, batchID string, batch *store
 		return fmt.Errorf("%w: %d approved reviewers < 2", ErrNotReady, len(approvers))
 	}
 	return nil
-}
-
-func (s *Service) issueCredential(ctx context.Context, batchID string, generation, tick int64) (string, error) {
-	buf := make([]byte, 32)
-	if _, err := rand.Read(buf); err != nil {
-		return "", err
-	}
-	credential := domain.RecoveryCredential{
-		Generation: generation,
-		Credential: buf,
-		IssuedTick: tick,
-	}
-	if err := s.store.PutCredential(ctx, batchID, credential); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(buf), nil
 }
 
 func containsReviewer(reviewers []string, reviewer string) bool {
